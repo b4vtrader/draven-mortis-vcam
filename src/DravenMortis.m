@@ -470,6 +470,19 @@ static void DMAttachOverlay(CALayer *preview) {
 static void (*orig_setSampleBufferDelegate)(id, SEL, id, dispatch_queue_t);
 static void (*orig_startRunning)(id, SEL);
 static void (*orig_previewLayoutSublayers)(id, SEL);
+static NSData *(*orig_photoFileData)(id, SEL);
+static CGImageRef (*orig_photoCGImage)(id, SEL);
+static CVPixelBufferRef (*orig_photoPixelBuffer)(id, SEL);
+static void (*orig_captureStillImage)(id, SEL, AVCaptureConnection *, void (^)(CMSampleBufferRef, NSError *));
+
+static NSData *DMGetTransformedJpegData(void) {
+    uint64_t serial = 0;
+    CGImageRef cg = DMCopyFrameCG(&serial);
+    if (!cg) return nil;
+    UIImage *img = [UIImage imageWithCGImage:cg];
+    CGImageRelease(cg);
+    return UIImageJPEGRepresentation(img, 0.92);
+}
 
 static void DMInstallCameraHooks(void) {
     SEL setDelSel = @selector(setSampleBufferDelegate:queue:);
@@ -502,6 +515,80 @@ static void DMInstallCameraHooks(void) {
             orig_previewLayoutSublayers(self, layoutSel);
             @try { DMAttachOverlay(self); } @catch (NSException *e) {}
         }, (IMP *)&orig_previewLayoutSublayers);
+
+    // --- STILL PHOTO HOOKS (Fixes photo capture taking real camera image) ---
+    Class photoClass = NSClassFromString(@"AVCapturePhoto");
+    if (photoClass) {
+        // 1. Hook fileDataRepresentation (JPEG/HEIC file output)
+        DMHook(photoClass, @selector(fileDataRepresentation),
+            ^NSData *(id self) {
+                if (g_enabled) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d) return d;
+                }
+                return orig_photoFileData ? orig_photoFileData(self, @selector(fileDataRepresentation)) : nil;
+            }, (IMP *)&orig_photoFileData);
+
+        // 2. Hook CGImageRepresentation
+        DMHook(photoClass, @selector(CGImageRepresentation),
+            ^CGImageRef(id self) {
+                if (g_enabled) {
+                    uint64_t serial = 0;
+                    CGImageRef cg = DMCopyFrameCG(&serial);
+                    if (cg) return cg;
+                }
+                return orig_photoCGImage ? orig_photoCGImage(self, @selector(CGImageRepresentation)) : NULL;
+            }, (IMP *)&orig_photoCGImage);
+
+        // 3. Hook pixelBuffer
+        DMHook(photoClass, @selector(pixelBuffer),
+            ^CVPixelBufferRef(id self) {
+                CVPixelBufferRef pb = orig_photoPixelBuffer ? orig_photoPixelBuffer(self, @selector(pixelBuffer)) : NULL;
+                if (g_enabled && pb) {
+                    size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
+                    CIImage *frame = DMCopyFrameImage();
+                    if (frame && W && H) {
+                        CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
+                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                        CVPixelBufferLockBaseAddress(pb, 0);
+                        if (!g_ciContext) {
+                            g_ciContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
+                        }
+                        [g_ciContext render:img toCVPixelBuffer:pb bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
+                        CVPixelBufferUnlockBaseAddress(pb, 0);
+                        CGColorSpaceRelease(cs);
+                    }
+                }
+                return pb;
+            }, (IMP *)&orig_photoPixelBuffer);
+    }
+
+    // 4. Hook AVCaptureStillImageOutput (legacy photo capture)
+    Class stillOutClass = NSClassFromString(@"AVCaptureStillImageOutput");
+    if (stillOutClass) {
+        DMHook(stillOutClass, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:),
+            ^(id self, AVCaptureConnection *conn, void (^handler)(CMSampleBufferRef, NSError *)) {
+                void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef sb, NSError *err) {
+                    if (g_enabled && sb) {
+                        @try { DMReplaceSampleBuffer(sb); } @catch (NSException *e) {}
+                    }
+                    if (handler) handler(sb, err);
+                };
+                orig_captureStillImage(self, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:), conn, wrapped);
+            }, (IMP *)&orig_captureStillImage);
+
+        Method m = class_getClassMethod(stillOutClass, @selector(jpegStillImageNSDataRepresentation:));
+        if (m) {
+            NSData *(*orig_jpegRep)(id, SEL, CMSampleBufferRef) = (NSData *(*)(id, SEL, CMSampleBufferRef))method_getImplementation(m);
+            method_setImplementation(m, imp_implementationWithBlock(^NSData *(id self, CMSampleBufferRef sb) {
+                if (g_enabled) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d) return d;
+                }
+                return orig_jpegRep(self, @selector(jpegStillImageNSDataRepresentation:), sb);
+            }));
+        }
+    }
 }
 
 static void DMAppApplyState(void) {
