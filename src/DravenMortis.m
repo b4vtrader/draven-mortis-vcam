@@ -583,7 +583,7 @@ static NSData *DMGetTransformedJpegData(void) {
     });
 
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    NSData *data = [s_jpegContext JPEGRepresentationOfImage:ci colorSpace:cs options:@{ (id)kCGImageDestinationLossyFactor: @0.92 }];
+    NSData *data = [s_jpegContext JPEGRepresentationOfImage:ci colorSpace:cs options:@{}];
     CGColorSpaceRelease(cs);
     CVPixelBufferRelease(pb);
 
