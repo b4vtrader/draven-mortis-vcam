@@ -12,8 +12,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Theos & SDKs
+      - name: Install Theos & Tools
         run: |
+          brew install ldid dpkg
           git clone --recursive https://github.com/theos/theos.git ~/theos
           curl -LO https://github.com/theos/sdks/archive/master.zip
           unzip -q master.zip
