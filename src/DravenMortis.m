@@ -150,6 +150,7 @@ static uint64_t g_frameSerial = 0;
 static CFAbsoluteTime g_frameTime = 0;
 
 static void DMStoreFrame(NSData *jpeg) {
+    if (!jpeg.length) return;
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
     if (!src) return;
     NSDictionary *opts = @{ (__bridge id)kCGImageSourceShouldCacheImmediately: @YES };
@@ -167,11 +168,34 @@ static void DMStoreFrame(NSData *jpeg) {
     g_frameTime = CFAbsoluteTimeGetCurrent();
     os_unfair_lock_unlock(&g_frameLock);
     if (old) CGImageRelease(old);
+
+    static CFAbsoluteTime lastDiskSave = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - lastDiskSave > 0.5) {
+        lastDiskSave = now;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            [jpeg writeToFile:@"/var/mobile/Media/draven_current.jpg" atomically:YES];
+        });
+    }
+}
+
+static void DMLoadFrameFromDiskIfNeeded(void) {
+    if (g_frameCG) return;
+    NSData *d = [NSData dataWithContentsOfFile:@"/var/mobile/Media/draven_current.jpg"];
+    if (!d.length) return;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)d, NULL);
+    if (!src) return;
+    CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!cg) return;
+    g_frameCG = cg;
+    g_frameImage = [CIImage imageWithCGImage:cg];
 }
 
 static CIImage *DMCopyFrameImage(void) {
     CIImage *img = nil;
     os_unfair_lock_lock(&g_frameLock);
+    DMLoadFrameFromDiskIfNeeded();
     img = g_frameImage;
     os_unfair_lock_unlock(&g_frameLock);
     return img;
@@ -180,6 +204,7 @@ static CIImage *DMCopyFrameImage(void) {
 static CGImageRef DMCopyFrameCG(uint64_t *serial) {
     CGImageRef r = NULL;
     os_unfair_lock_lock(&g_frameLock);
+    DMLoadFrameFromDiskIfNeeded();
     if (g_frameCG) {
         r = CGImageRetain(g_frameCG);
         if (serial) *serial = g_frameSerial;
@@ -200,7 +225,10 @@ static BOOL DMRecvAll(int sock, void *buf, size_t len, int32_t gen) {
         ssize_t r = recv(sock, (char *)buf + got, len - got, 0);
         if (r > 0) { got += (size_t)r; continue; }
         if (r == 0) return NO;
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue; // PC idle, keep waiting
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ETIMEDOUT) {
+            usleep(5000);
+            continue;
+        }
         return NO;
     }
     return YES;
@@ -227,7 +255,8 @@ static void DMStreamLoop(int32_t gen) {
                     uint32_t netLen = 0;
                     if (!DMRecvAll(sock, &netLen, 4, gen)) break;
                     uint32_t len = ntohl(netLen);
-                    if (len == 0 || len > 12 * 1024 * 1024) break;
+                    if (len == 0) continue;
+                    if (len > 12 * 1024 * 1024) break;
                     NSMutableData *buf = [NSMutableData dataWithLength:len];
                     if (!DMRecvAll(sock, buf.mutableBytes, len, gen)) break;
                     DMStoreFrame(buf);
@@ -284,7 +313,7 @@ static CIContext *g_ciContext = nil;
 static NSMutableSet<NSString *> *g_hookedDelegates = nil;
 
 static void DMAppUpdateStreaming(BOOL ipChanged) {
-    BOOL want = g_enabled && g_cameraActive && g_ip;
+    BOOL want = g_enabled && g_ip;
     if (!want) { DMStreamStop(); return; }
     if (ipChanged) DMStreamStop();
     DMStreamStart();
@@ -539,6 +568,7 @@ static void DMAttachOverlay(CALayer *preview) {
     if (objc_getAssociatedObject(preview, kDMOverlayKey)) return;
 
     CALayer *container = [CALayer layer];
+    container.backgroundColor = [UIColor blackColor].CGColor;
     container.masksToBounds = YES;
     container.zPosition = 1000;
     container.hidden = YES;
