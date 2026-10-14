@@ -1,0 +1,33 @@
+name: Build Draven Mortis PRO
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos & SDKs
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          curl -LO https://github.com/theos/sdks/archive/master.zip
+          unzip -q master.zip
+          mv sdks-master/*.sdk ~/theos/sdks/
+          rm -rf sdks-master master.zip
+
+      - name: Compile Package
+        run: |
+          export THEOS=~/theos
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: DravenMortis-deb
+          path: packages/*.deb
