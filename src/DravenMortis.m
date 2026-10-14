@@ -344,6 +344,85 @@ static void DMReplaceSampleBuffer(CMSampleBufferRef sb) {
     CGColorSpaceRelease(cs);
 }
 
+// --- Low-level CMSampleBuffer creation from PC image ---
+
+static CVPixelBufferRef DMCreatePixelBufferFromCGImage(CGImageRef image, size_t targetWidth, size_t targetHeight) {
+    if (!image || targetWidth == 0 || targetHeight == 0) return NULL;
+    NSDictionary *options = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+    };
+    CVPixelBufferRef pxbuffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, targetWidth, targetHeight,
+                                          kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)options,
+                                          &pxbuffer);
+    if (status != kCVReturnSuccess || !pxbuffer) return NULL;
+
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
+    size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pxbuffer);
+
+    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pxdata, targetWidth, targetHeight, 8, bytesPerRow,
+                                                 rgbColorSpace, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+
+    if (context) {
+        CGContextClearRect(context, CGRectMake(0, 0, targetWidth, targetHeight));
+        CGFloat sw = CGImageGetWidth(image);
+        CGFloat sh = CGImageGetHeight(image);
+        CGFloat scale = MAX((CGFloat)targetWidth / sw, (CGFloat)targetHeight / sh) * g_zoom;
+        CGFloat dw = sw * scale;
+        CGFloat dh = sh * scale;
+        CGFloat dx = ((CGFloat)targetWidth - dw) / 2.0;
+        CGFloat dy = ((CGFloat)targetHeight - dh) / 2.0;
+
+        CGContextDrawImage(context, CGRectMake(dx, dy, dw, dh), image);
+        CGContextRelease(context);
+    }
+    CGColorSpaceRelease(rgbColorSpace);
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    return pxbuffer;
+}
+
+static CMSampleBufferRef DMCreateSampleBufferFromPCFrame(CMSampleBufferRef originSampleBuffer) {
+    if (!originSampleBuffer) return NULL;
+    uint64_t serial = 0;
+    CGImageRef cg = DMCopyFrameCG(&serial);
+    if (!cg) return NULL;
+
+    CVImageBufferRef origImageBuffer = CMSampleBufferGetImageBuffer(originSampleBuffer);
+    size_t width = origImageBuffer ? CVPixelBufferGetWidth(origImageBuffer) : 1080;
+    size_t height = origImageBuffer ? CVPixelBufferGetHeight(origImageBuffer) : 1920;
+
+    CVPixelBufferRef pixelBuffer = DMCreatePixelBufferFromCGImage(cg, width, height);
+    CGImageRelease(cg);
+    if (!pixelBuffer) return NULL;
+
+    CMSampleTimingInfo sampleTime = {
+        .duration = CMSampleBufferGetDuration(originSampleBuffer),
+        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+    };
+
+    CMVideoFormatDescriptionRef videoInfo = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &videoInfo);
+
+    CMSampleBufferRef newBuffer = NULL;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, videoInfo, &sampleTime, &newBuffer);
+
+    if (videoInfo) CFRelease(videoInfo);
+    CVPixelBufferRelease(pixelBuffer);
+
+    if (newBuffer) {
+        CFDictionaryRef exif = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+        if (exif) CMSetAttachment(newBuffer, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
+        CFDictionaryRef tiff = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+        if (tiff) CMSetAttachment(newBuffer, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
+    }
+
+    return newBuffer;
+}
+
 typedef void (*DMCaptureIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
 // Every delegate class gets its OWN block IMP capturing its OWN original IMP.
@@ -372,10 +451,22 @@ static void DMHookDelegateClass(Class cls) {
         DMCaptureIMP orig = (DMCaptureIMP)method_getImplementation(m);
         if (!orig) return;
         IMP hook = imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+            CMSampleBufferRef bufferToPass = sampleBuffer;
+            CMSampleBufferRef customBuffer = NULL;
             if (g_enabled) {
-                @try { DMReplaceSampleBuffer(sampleBuffer); } @catch (NSException *e) {}
+                @try {
+                    customBuffer = DMCreateSampleBufferFromPCFrame(sampleBuffer);
+                    if (customBuffer) {
+                        bufferToPass = customBuffer;
+                    }
+                } @catch (NSException *e) {
+                    DMLog(@"Exception creating sample buffer: %@", e);
+                }
             }
-            orig(self, sel, output, sampleBuffer, connection);
+            orig(self, sel, output, bufferToPass, connection);
+            if (customBuffer) {
+                CFRelease(customBuffer);
+            }
         });
         method_setImplementation(m, hook);
         DMLog(@"Hook de camara en %@", key);
@@ -563,16 +654,77 @@ static void DMInstallCameraHooks(void) {
             }, (IMP *)&orig_photoPixelBuffer);
     }
 
-    // 4. Hook AVCaptureStillImageOutput (legacy photo capture)
+    // 4. Hook AVCapturePhotoOutput (Modern photo capture)
+    Class photoOutClass = NSClassFromString(@"AVCapturePhotoOutput");
+    if (photoOutClass) {
+        // Class method fallback for JPEG representation
+        Method jm = class_getClassMethod(photoOutClass, @selector(JPEGPhotoDataRepresentationForJPEGSampleBuffer:previewPhotoSampleBuffer:));
+        if (jm) {
+            NSData *(*orig_jpegRepPhoto)(id, SEL, CMSampleBufferRef, CMSampleBufferRef) = (NSData *(*)(id, SEL, CMSampleBufferRef, CMSampleBufferRef))method_getImplementation(jm);
+            method_setImplementation(jm, imp_implementationWithBlock(^NSData *(id self, CMSampleBufferRef jsb, CMSampleBufferRef psb) {
+                if (g_enabled) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d) return d;
+                }
+                return orig_jpegRepPhoto(self, @selector(JPEGPhotoDataRepresentationForJPEGSampleBuffer:previewPhotoSampleBuffer:), jsb, psb);
+            }));
+        }
+
+        static void (*orig_capturePhoto)(id, SEL, AVCapturePhotoSettings *, id<AVCapturePhotoCaptureDelegate>);
+        DMHook(photoOutClass, @selector(capturePhotoWithSettings:delegate:),
+            ^(id self, AVCapturePhotoSettings *settings, id<AVCapturePhotoCaptureDelegate> delegate) {
+                if (delegate && g_enabled) {
+                    Class dClass = [delegate class];
+                    SEL photoSel = @selector(captureOutput:didFinishProcessingPhoto:error:);
+                    Method pm = class_getInstanceMethod(dClass, photoSel);
+                    if (pm) {
+                        static NSMutableSet *hookedPhotoDelegates = nil;
+                        static dispatch_once_t once;
+                        dispatch_once(&once, ^{ hookedPhotoDelegates = [NSMutableSet set]; });
+                        NSString *cName = NSStringFromClass(dClass);
+                        if (![hookedPhotoDelegates containsObject:cName]) {
+                            [hookedPhotoDelegates addObject:cName];
+                            void (*orig_didFinish)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = (void (*)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *))method_getImplementation(pm);
+                            method_setImplementation(pm, imp_implementationWithBlock(^(id dSelf, AVCapturePhotoOutput *outp, AVCapturePhoto *photo, NSError *err) {
+                                if (g_enabled && photo) {
+                                    // Dynamically hook this photo instance methods
+                                    Class pInstClass = [photo class];
+                                    Method mFile = class_getInstanceMethod(pInstClass, @selector(fileDataRepresentation));
+                                    if (mFile) {
+                                        method_setImplementation(mFile, imp_implementationWithBlock(^NSData *(id pSelf) {
+                                            if (g_enabled) {
+                                                NSData *d = DMGetTransformedJpegData();
+                                                if (d) return d;
+                                            }
+                                            return orig_photoFileData ? orig_photoFileData(pSelf, @selector(fileDataRepresentation)) : nil;
+                                        }));
+                                    }
+                                }
+                                orig_didFinish(dSelf, photoSel, outp, photo, err);
+                            }));
+                        }
+                    }
+                }
+                orig_capturePhoto(self, @selector(capturePhotoWithSettings:delegate:), settings, delegate);
+            }, (IMP *)&orig_capturePhoto);
+    }
+
+    // 5. Hook AVCaptureStillImageOutput (legacy photo capture)
     Class stillOutClass = NSClassFromString(@"AVCaptureStillImageOutput");
     if (stillOutClass) {
         DMHook(stillOutClass, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:),
             ^(id self, AVCaptureConnection *conn, void (^handler)(CMSampleBufferRef, NSError *)) {
                 void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef sb, NSError *err) {
+                    CMSampleBufferRef bufToPass = sb;
+                    CMSampleBufferRef customBuffer = NULL;
                     if (g_enabled && sb) {
-                        @try { DMReplaceSampleBuffer(sb); } @catch (NSException *e) {}
+                        @try {
+                            customBuffer = DMCreateSampleBufferFromPCFrame(sb);
+                            if (customBuffer) bufToPass = customBuffer;
+                        } @catch (NSException *e) {}
                     }
-                    if (handler) handler(sb, err);
+                    if (handler) handler(bufToPass, err);
+                    if (customBuffer) CFRelease(customBuffer);
                 };
                 orig_captureStillImage(self, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:), conn, wrapped);
             }, (IMP *)&orig_captureStillImage);
