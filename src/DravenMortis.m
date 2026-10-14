@@ -172,7 +172,7 @@ static void DMStoreFrame(NSData *jpeg) {
 static CIImage *DMCopyFrameImage(void) {
     CIImage *img = nil;
     os_unfair_lock_lock(&g_frameLock);
-    if (CFAbsoluteTimeGetCurrent() - g_frameTime < 3.0) img = g_frameImage;
+    img = g_frameImage;
     os_unfair_lock_unlock(&g_frameLock);
     return img;
 }
@@ -180,9 +180,9 @@ static CIImage *DMCopyFrameImage(void) {
 static CGImageRef DMCopyFrameCG(uint64_t *serial) {
     CGImageRef r = NULL;
     os_unfair_lock_lock(&g_frameLock);
-    if (g_frameCG && CFAbsoluteTimeGetCurrent() - g_frameTime < 3.0) {
+    if (g_frameCG) {
         r = CGImageRetain(g_frameCG);
-        *serial = g_frameSerial;
+        if (serial) *serial = g_frameSerial;
     }
     os_unfair_lock_unlock(&g_frameLock);
     return r;
@@ -323,34 +323,14 @@ static CIImage *DMTransformedFrame(CIImage *src, CGFloat W, CGFloat H) {
     return [img imageByApplyingTransform:CGAffineTransformMakeTranslation(tx, ty)];
 }
 
-static void DMReplaceSampleBuffer(CMSampleBufferRef sb) {
-    if (!g_enabled || !sb) return;
-    CIImage *frame = DMCopyFrameImage();
-    if (!frame) return;
-
-    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-    if (!pb) return;
-    size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
-    if (!W || !H) return;
-
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_ciContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
-    });
-
-    CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    [g_ciContext render:img toCVPixelBuffer:pb bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
-    CGColorSpaceRelease(cs);
-}
-
 // --- Low-level CMSampleBuffer creation from PC image ---
 
 static CVPixelBufferRef DMCreatePixelBufferFromCGImage(CGImageRef image, size_t targetWidth, size_t targetHeight) {
     if (!image || targetWidth == 0 || targetHeight == 0) return NULL;
     NSDictionary *options = @{
         (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
     };
     CVPixelBufferRef pxbuffer = NULL;
     CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, targetWidth, targetHeight,
@@ -368,15 +348,28 @@ static CVPixelBufferRef DMCreatePixelBufferFromCGImage(CGImageRef image, size_t 
 
     if (context) {
         CGContextClearRect(context, CGRectMake(0, 0, targetWidth, targetHeight));
+
+        // Coordinate system flip: CGContext starts at bottom-left
+        CGContextTranslateCTM(context, 0, targetHeight);
+        CGContextScaleCTM(context, 1.0, -1.0);
+
+        // Center origin for transformations
+        CGContextTranslateCTM(context, targetWidth / 2.0, targetHeight / 2.0);
+
+        if (g_rotation != 0) {
+            CGContextRotateCTM(context, g_rotation * M_PI_2);
+        }
+        if (g_flip) {
+            CGContextScaleCTM(context, -1.0, 1.0);
+        }
+
         CGFloat sw = CGImageGetWidth(image);
         CGFloat sh = CGImageGetHeight(image);
         CGFloat scale = MAX((CGFloat)targetWidth / sw, (CGFloat)targetHeight / sh) * g_zoom;
         CGFloat dw = sw * scale;
         CGFloat dh = sh * scale;
-        CGFloat dx = ((CGFloat)targetWidth - dw) / 2.0;
-        CGFloat dy = ((CGFloat)targetHeight - dh) / 2.0;
 
-        CGContextDrawImage(context, CGRectMake(dx, dy, dw, dh), image);
+        CGContextDrawImage(context, CGRectMake(-dw / 2.0, -dh / 2.0, dw, dh), image);
         CGContextRelease(context);
     }
     CGColorSpaceRelease(rgbColorSpace);
@@ -570,9 +563,31 @@ static NSData *DMGetTransformedJpegData(void) {
     uint64_t serial = 0;
     CGImageRef cg = DMCopyFrameCG(&serial);
     if (!cg) return nil;
-    UIImage *img = [UIImage imageWithCGImage:cg];
+
+    size_t w = CGImageGetWidth(cg);
+    size_t h = CGImageGetHeight(cg);
+    if (w == 0 || h == 0) {
+        CGImageRelease(cg);
+        return nil;
+    }
+
+    CVPixelBufferRef pb = DMCreatePixelBufferFromCGImage(cg, w, h);
     CGImageRelease(cg);
-    return UIImageJPEGRepresentation(img, 0.92);
+    if (!pb) return nil;
+
+    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+    static CIContext *s_jpegContext = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s_jpegContext = [CIContext contextWithOptions:nil];
+    });
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    NSData *data = [s_jpegContext JPEGRepresentationOfImage:ci colorSpace:cs options:@{ (id)kCGImageDestinationLossyFactor: @0.92 }];
+    CGColorSpaceRelease(cs);
+    CVPixelBufferRelease(pb);
+
+    return data;
 }
 
 static void DMInstallCameraHooks(void) {
@@ -599,6 +614,17 @@ static void DMInstallCameraHooks(void) {
             DMEnsureStreaming();
             orig_startRunning(self, startSel);
         }, (IMP *)&orig_startRunning);
+
+    SEL addOutSel = @selector(addOutput:);
+    static void (*orig_addOutput)(id, SEL, AVCaptureOutput *);
+    DMHook(NSClassFromString(@"AVCaptureSession"), addOutSel,
+        ^(AVCaptureSession *self, AVCaptureOutput *output) {
+            orig_addOutput(self, addOutSel, output);
+            if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+                id d = [(AVCaptureVideoDataOutput *)output sampleBufferDelegate];
+                if (d) DMHookDelegateClass([d class]);
+            }
+        }, (IMP *)&orig_addOutput);
 
     SEL layoutSel = @selector(layoutSublayers);
     DMHook(NSClassFromString(@"AVCaptureVideoPreviewLayer"), layoutSel,
@@ -634,23 +660,19 @@ static void DMInstallCameraHooks(void) {
         // 3. Hook pixelBuffer
         DMHook(photoClass, @selector(pixelBuffer),
             ^CVPixelBufferRef(id self) {
-                CVPixelBufferRef pb = orig_photoPixelBuffer ? orig_photoPixelBuffer(self, @selector(pixelBuffer)) : NULL;
-                if (g_enabled && pb) {
-                    size_t W = CVPixelBufferGetWidth(pb), H = CVPixelBufferGetHeight(pb);
-                    CIImage *frame = DMCopyFrameImage();
-                    if (frame && W && H) {
-                        CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
-                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-                        CVPixelBufferLockBaseAddress(pb, 0);
-                        if (!g_ciContext) {
-                            g_ciContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
-                        }
-                        [g_ciContext render:img toCVPixelBuffer:pb bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
-                        CVPixelBufferUnlockBaseAddress(pb, 0);
-                        CGColorSpaceRelease(cs);
+                if (g_enabled) {
+                    uint64_t serial = 0;
+                    CGImageRef cg = DMCopyFrameCG(&serial);
+                    if (cg) {
+                        CVPixelBufferRef origPb = orig_photoPixelBuffer ? orig_photoPixelBuffer(self, @selector(pixelBuffer)) : NULL;
+                        size_t W = origPb ? CVPixelBufferGetWidth(origPb) : CGImageGetWidth(cg);
+                        size_t H = origPb ? CVPixelBufferGetHeight(origPb) : CGImageGetHeight(cg);
+                        CVPixelBufferRef customPb = DMCreatePixelBufferFromCGImage(cg, W, H);
+                        CGImageRelease(cg);
+                        if (customPb) return customPb;
                     }
                 }
-                return pb;
+                return orig_photoPixelBuffer ? orig_photoPixelBuffer(self, @selector(pixelBuffer)) : NULL;
             }, (IMP *)&orig_photoPixelBuffer);
     }
 
