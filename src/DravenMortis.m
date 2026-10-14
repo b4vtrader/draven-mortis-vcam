@@ -765,6 +765,75 @@ static void DMInstallCameraHooks(void) {
     }
 }
 
+static void (*orig_emitSampleBuffer)(id, SEL, CMSampleBufferRef);
+
+static void DMHookBWNodeOutput(void) {
+    Class cls = NSClassFromString(@"BWNodeOutput");
+    if (!cls) return;
+    SEL sel = @selector(emitSampleBuffer:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        orig_emitSampleBuffer = (void (*)(id, SEL, CMSampleBufferRef))method_getImplementation(m);
+        method_setImplementation(m, imp_implementationWithBlock(^(id self, CMSampleBufferRef sampleBuffer) {
+            if (g_enabled && sampleBuffer) {
+                CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+                if (pixelBuffer) {
+                    CIImage *frame = DMCopyFrameImage();
+                    if (frame) {
+                        @try {
+                            CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+                            size_t W = CVPixelBufferGetWidth(pixelBuffer);
+                            size_t H = CVPixelBufferGetHeight(pixelBuffer);
+                            if (W > 0 && H > 0) {
+                                CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
+                                static CIContext *s_bwnodeContext = nil;
+                                static dispatch_once_t ctxOnce;
+                                dispatch_once(&ctxOnce, ^{
+                                    s_bwnodeContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
+                                });
+                                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                                [s_bwnodeContext render:img toCVPixelBuffer:pixelBuffer bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
+                                CGColorSpaceRelease(cs);
+                            }
+                        } @catch (NSException *e) {
+                            DMLog(@"Exception in BWNodeOutput: %@", e);
+                        } @finally {
+                            CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+                        }
+                    }
+                }
+            }
+            orig_emitSampleBuffer(self, sel, sampleBuffer);
+        }));
+        DMLog(@"[DravenMortis] BWNodeOutput emitSampleBuffer hooked!");
+    });
+}
+
+static void DMMediaServerApplyState(void) {
+    uint64_t s = 0;
+    if (g_appStateToken < 0 || notify_get_state(g_appStateToken, &s) != NOTIFY_STATUS_OK) return;
+    uint32_t oldIP = g_ip;
+    if (!DMDecodeState(s)) return;
+    if (g_enabled && g_ip) {
+        if (oldIP != g_ip) DMStreamStop();
+        DMStreamStart();
+    } else {
+        DMStreamStop();
+    }
+}
+
+static void DMMediaServerInit(void) {
+    notify_register_dispatch(kDMStateName, &g_appStateToken, dispatch_get_main_queue(), ^(int token) {
+        DMMediaServerApplyState();
+    });
+    DMMediaServerApplyState();
+    DMHookBWNodeOutput();
+    DMLog(@"[DravenMortis] DMMediaServerInit completado en mediaserverd");
+}
+
 static void DMAppApplyState(void) {
     uint64_t s = 0;
     if (g_appStateToken < 0 || notify_get_state(g_appStateToken, &s) != NOTIFY_STATUS_OK) return;
@@ -779,6 +848,7 @@ static void DMAppInit(void) {
     });
     DMAppApplyState();
     DMInstallCameraHooks();
+    DMHookBWNodeOutput();
 
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
@@ -1258,7 +1328,7 @@ static void DMSpringBoardInit(void) {
 // ============================================================================
 
 static BOOL DMIsTargetApp(NSString *bundleID, NSString *bundlePath) {
-    if (!bundleID.length || ![bundlePath hasSuffix:@".app"]) return NO; // no extensions/daemons
+    if (!bundleID.length) return NO;
 
     static NSArray *blocked;
     static dispatch_once_t once;
@@ -1271,17 +1341,23 @@ static BOOL DMIsTargetApp(NSString *bundleID, NSString *bundlePath) {
     }
 
     if ([bundleID isEqualToString:@"com.apple.camera"]) return YES;
-    return [bundlePath containsString:@"/containers/Bundle/Application/"]; // App Store / sideloaded apps
+    if ([bundlePath containsString:@"/containers/Bundle/Application/"]) return YES;
+    if ([bundlePath containsString:@"/Applications/"]) return YES;
+    return NO;
 }
 
 __attribute__((constructor)) static void DMInit(void) {
     @autoreleasepool {
+        NSString *procName = [[NSProcessInfo processInfo] processName];
         NSBundle *main = [NSBundle mainBundle];
         NSString *bundleID = main.bundleIdentifier;
         @try {
             if ([bundleID isEqualToString:@"com.apple.springboard"]) {
                 DMLog(@"Cargado en SpringBoard");
                 DMSpringBoardInit();
+            } else if ([procName isEqualToString:@"mediaserverd"] || [procName containsString:@"mediaserverd"]) {
+                DMLog(@"Cargado en mediaserverd");
+                DMMediaServerInit();
             } else if (DMIsTargetApp(bundleID, main.bundlePath)) {
                 DMLog(@"Cargado en %@", bundleID);
                 DMAppInit();
