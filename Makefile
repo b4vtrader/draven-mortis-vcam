@@ -9,6 +9,6 @@ TWEAK_NAME = DravenMortis
 
 DravenMortis_FILES = src/DravenMortis.m
 DravenMortis_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
-DravenMortis_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo CoreImage CoreGraphics QuartzCore ImageIO
+DravenMortis_FRAMEWORKS = UIKit Foundation AVFoundation CoreMedia CoreVideo CoreImage CoreGraphics QuartzCore ImageIO Photos
 
 include $(THEOS_MAKE_PATH)/tweak.mk
