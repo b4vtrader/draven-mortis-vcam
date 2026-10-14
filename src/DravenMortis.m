@@ -17,6 +17,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <ImageIO/ImageIO.h>
+#import <Photos/Photos.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
@@ -174,6 +175,8 @@ static void DMStoreFrame(NSData *jpeg) {
     if (now - lastDiskSave > 0.5) {
         lastDiskSave = now;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+            [jpeg writeToFile:@"/var/mobile/Library/Caches/draven_current.jpg" atomically:YES];
+            [jpeg writeToFile:@"/tmp/draven_current.jpg" atomically:YES];
             [jpeg writeToFile:@"/var/mobile/Media/draven_current.jpg" atomically:YES];
         });
     }
@@ -181,7 +184,25 @@ static void DMStoreFrame(NSData *jpeg) {
 
 static void DMLoadFrameFromDiskIfNeeded(void) {
     if (g_frameCG) return;
-    NSData *d = [NSData dataWithContentsOfFile:@"/var/mobile/Media/draven_current.jpg"];
+    NSArray *paths = @[
+        @"/var/mobile/Library/Caches/draven_current.jpg",
+        @"/tmp/draven_current.jpg",
+        @"/var/mobile/Media/draven_current.jpg"
+    ];
+    NSData *d = nil;
+    for (NSString *p in paths) {
+        d = [NSData dataWithContentsOfFile:p];
+        if (d.length) break;
+    }
+    if (!d.length && g_ip) {
+        NSString *urlStr = [NSString stringWithFormat:@"http://%@:9999/api/frame", DMIPString()];
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlStr]];
+        req.timeoutInterval = 1.0;
+        NSURLResponse *resp = nil;
+        NSError *err = nil;
+        NSData *httpData = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+        if (httpData.length > 1000) d = httpData;
+    }
     if (!d.length) return;
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)d, NULL);
     if (!src) return;
@@ -473,22 +494,35 @@ static void DMHookDelegateClass(Class cls) {
         DMCaptureIMP orig = (DMCaptureIMP)method_getImplementation(m);
         if (!orig) return;
         IMP hook = imp_implementationWithBlock(^(id self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
-            CMSampleBufferRef bufferToPass = sampleBuffer;
-            CMSampleBufferRef customBuffer = NULL;
-            if (g_enabled) {
-                @try {
-                    customBuffer = DMCreateSampleBufferFromPCFrame(sampleBuffer);
-                    if (customBuffer) {
-                        bufferToPass = customBuffer;
+            if (g_enabled && sampleBuffer) {
+                CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+                if (pixelBuffer) {
+                    CIImage *frame = DMCopyFrameImage();
+                    if (frame) {
+                        @try {
+                            CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+                            size_t W = CVPixelBufferGetWidth(pixelBuffer);
+                            size_t H = CVPixelBufferGetHeight(pixelBuffer);
+                            if (W > 0 && H > 0) {
+                                CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
+                                static CIContext *s_delContext = nil;
+                                static dispatch_once_t ctxOnce;
+                                dispatch_once(&ctxOnce, ^{
+                                    s_delContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
+                                });
+                                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                                [s_delContext render:img toCVPixelBuffer:pixelBuffer bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
+                                CGColorSpaceRelease(cs);
+                            }
+                        } @catch (NSException *e) {
+                            DMLog(@"Exception in delegate buffer render: %@", e);
+                        } @finally {
+                            CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+                        }
                     }
-                } @catch (NSException *e) {
-                    DMLog(@"Exception creating sample buffer: %@", e);
                 }
             }
-            orig(self, sel, output, bufferToPass, connection);
-            if (customBuffer) {
-                CFRelease(customBuffer);
-            }
+            orig(self, sel, output, sampleBuffer, connection);
         });
         method_setImplementation(m, hook);
         DMLog(@"Hook de camara en %@", key);
@@ -532,17 +566,24 @@ static uint64_t g_shownSerial = 0;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     for (CALayer *preview in g_previewLayers) {
+        if ([preview isKindOfClass:NSClassFromString(@"AVCaptureVideoPreviewLayer")]) {
+            AVCaptureConnection *conn = [(AVCaptureVideoPreviewLayer *)preview connection];
+            if (conn && conn.enabled != !on) {
+                conn.enabled = !on;
+            }
+        }
         CALayer *container = objc_getAssociatedObject(preview, kDMOverlayKey);
         CALayer *content = container.sublayers.firstObject;
         if (!container || !content) continue;
-        if (!img) { container.hidden = YES; continue; }
+        if (!img || !on) {
+            container.hidden = YES;
+            continue;
+        }
 
         container.hidden = NO;
         container.frame = preview.bounds;
-        CGSize s = preview.bounds.size;
-        BOOL swap = (g_rotation & 1) != 0;
-        content.bounds = CGRectMake(0, 0, swap ? s.height : s.width, swap ? s.width : s.height);
-        content.position = CGPointMake(s.width / 2.0, s.height / 2.0);
+        content.frame = container.bounds;
+        content.contentsGravity = kCAGravityResizeAspectFill;
         CATransform3D t = CATransform3DMakeRotation(g_rotation * M_PI_2, 0, 0, 1);
         t = CATransform3DScale(t, g_flip ? -g_zoom : g_zoom, g_zoom, 1);
         content.transform = t;
@@ -739,7 +780,6 @@ static void DMInstallCameraHooks(void) {
                             void (*orig_didFinish)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *) = (void (*)(id, SEL, AVCapturePhotoOutput *, AVCapturePhoto *, NSError *))method_getImplementation(pm);
                             method_setImplementation(pm, imp_implementationWithBlock(^(id dSelf, AVCapturePhotoOutput *outp, AVCapturePhoto *photo, NSError *err) {
                                 if (g_enabled && photo) {
-                                    // Dynamically hook this photo instance methods
                                     Class pInstClass = [photo class];
                                     Method mFile = class_getInstanceMethod(pInstClass, @selector(fileDataRepresentation));
                                     if (mFile) {
@@ -749,6 +789,38 @@ static void DMInstallCameraHooks(void) {
                                                 if (d) return d;
                                             }
                                             return orig_photoFileData ? orig_photoFileData(pSelf, @selector(fileDataRepresentation)) : nil;
+                                        }));
+                                    }
+                                    Method mFileCust = class_getInstanceMethod(pInstClass, @selector(fileDataRepresentationWithCustomizer:));
+                                    if (mFileCust) {
+                                        method_setImplementation(mFileCust, imp_implementationWithBlock(^NSData *(id pSelf, id cust) {
+                                            if (g_enabled) {
+                                                NSData *d = DMGetTransformedJpegData();
+                                                if (d) return d;
+                                            }
+                                            return nil;
+                                        }));
+                                    }
+                                    Method mCG = class_getInstanceMethod(pInstClass, @selector(CGImageRepresentation));
+                                    if (mCG) {
+                                        method_setImplementation(mCG, imp_implementationWithBlock(^CGImageRef(id pSelf) {
+                                            if (g_enabled) {
+                                                uint64_t s = 0;
+                                                CGImageRef cg = DMCopyFrameCG(&s);
+                                                if (cg) return cg;
+                                            }
+                                            return orig_photoCGImage ? orig_photoCGImage(pSelf, @selector(CGImageRepresentation)) : NULL;
+                                        }));
+                                    }
+                                    Method mPrevCG = class_getInstanceMethod(pInstClass, @selector(previewCGImageRepresentation));
+                                    if (mPrevCG) {
+                                        method_setImplementation(mPrevCG, imp_implementationWithBlock(^CGImageRef(id pSelf) {
+                                            if (g_enabled) {
+                                                uint64_t s = 0;
+                                                CGImageRef cg = DMCopyFrameCG(&s);
+                                                if (cg) return cg;
+                                            }
+                                            return NULL;
                                         }));
                                     }
                                 }
@@ -767,16 +839,34 @@ static void DMInstallCameraHooks(void) {
         DMHook(stillOutClass, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:),
             ^(id self, AVCaptureConnection *conn, void (^handler)(CMSampleBufferRef, NSError *)) {
                 void (^wrapped)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef sb, NSError *err) {
-                    CMSampleBufferRef bufToPass = sb;
-                    CMSampleBufferRef customBuffer = NULL;
                     if (g_enabled && sb) {
-                        @try {
-                            customBuffer = DMCreateSampleBufferFromPCFrame(sb);
-                            if (customBuffer) bufToPass = customBuffer;
-                        } @catch (NSException *e) {}
+                        CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sb);
+                        if (pixelBuffer) {
+                            CIImage *frame = DMCopyFrameImage();
+                            if (frame) {
+                                @try {
+                                    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+                                    size_t W = CVPixelBufferGetWidth(pixelBuffer);
+                                    size_t H = CVPixelBufferGetHeight(pixelBuffer);
+                                    if (W > 0 && H > 0) {
+                                        CIImage *img = DMTransformedFrame(frame, (CGFloat)W, (CGFloat)H);
+                                        static CIContext *s_stillContext = nil;
+                                        static dispatch_once_t ctxOnce;
+                                        dispatch_once(&ctxOnce, ^{
+                                            s_stillContext = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates: @NO }];
+                                        });
+                                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                                        [s_stillContext render:img toCVPixelBuffer:pixelBuffer bounds:CGRectMake(0, 0, W, H) colorSpace:cs];
+                                        CGColorSpaceRelease(cs);
+                                    }
+                                } @catch (NSException *e) {
+                                } @finally {
+                                    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+                                }
+                            }
+                        }
                     }
-                    if (handler) handler(bufToPass, err);
-                    if (customBuffer) CFRelease(customBuffer);
+                    if (handler) handler(sb, err);
                 };
                 orig_captureStillImage(self, @selector(captureStillImageAsynchronouslyFromConnection:completionHandler:), conn, wrapped);
             }, (IMP *)&orig_captureStillImage);
@@ -790,6 +880,70 @@ static void DMInstallCameraHooks(void) {
                     if (d) return d;
                 }
                 return orig_jpegRep(self, @selector(jpegStillImageNSDataRepresentation:), sb);
+            }));
+        }
+    }
+
+    // 6. Hook Photos.framework (Camera.app writing photos to Camera Roll)
+    Class phCreateReq = NSClassFromString(@"PHAssetCreationRequest");
+    if (phCreateReq) {
+        static void (*orig_addResData)(id, SEL, NSInteger, NSData *, id);
+        DMHook(phCreateReq, @selector(addResourceWithType:data:options:),
+            ^(id self, NSInteger type, NSData *data, id options) {
+                if (g_enabled && (type == 1 || type == 2)) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d.length) data = d;
+                }
+                orig_addResData(self, @selector(addResourceWithType:data:options:), type, data, options);
+            }, (IMP *)&orig_addResData);
+
+        static void (*orig_addResURL)(id, SEL, NSInteger, NSURL *, id);
+        DMHook(phCreateReq, @selector(addResourceWithType:fileURL:options:),
+            ^(id self, NSInteger type, NSURL *url, id options) {
+                if (g_enabled && (type == 1 || type == 2)) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d.length) {
+                        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"draven_ph_%f.jpg", [[NSDate date] timeIntervalSince1970]]];
+                        if ([d writeToFile:tmp atomically:YES]) {
+                            url = [NSURL fileURLWithPath:tmp];
+                        }
+                    }
+                }
+                orig_addResURL(self, @selector(addResourceWithType:fileURL:options:), type, url, options);
+            }, (IMP *)&orig_addResURL);
+    }
+
+    Class phChangeReq = NSClassFromString(@"PHAssetChangeRequest");
+    if (phChangeReq) {
+        Method mImg = class_getClassMethod(phChangeReq, @selector(creationRequestForAssetFromImage:));
+        if (mImg) {
+            id (*orig_reqImg)(id, SEL, UIImage *) = (id (*)(id, SEL, UIImage *))method_getImplementation(mImg);
+            method_setImplementation(mImg, imp_implementationWithBlock(^id(id self, UIImage *image) {
+                if (g_enabled) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d.length) {
+                        UIImage *rep = [UIImage imageWithData:d];
+                        if (rep) image = rep;
+                    }
+                }
+                return orig_reqImg(self, @selector(creationRequestForAssetFromImage:), image);
+            }));
+        }
+
+        Method mURL = class_getClassMethod(phChangeReq, @selector(creationRequestForAssetFromImageAtFileURL:));
+        if (mURL) {
+            id (*orig_reqURL)(id, SEL, NSURL *) = (id (*)(id, SEL, NSURL *))method_getImplementation(mURL);
+            method_setImplementation(mURL, imp_implementationWithBlock(^id(id self, NSURL *fileURL) {
+                if (g_enabled) {
+                    NSData *d = DMGetTransformedJpegData();
+                    if (d.length) {
+                        NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"draven_ph_%f.jpg", [[NSDate date] timeIntervalSince1970]]];
+                        if ([d writeToFile:tmp atomically:YES]) {
+                            fileURL = [NSURL fileURLWithPath:tmp];
+                        }
+                    }
+                }
+                return orig_reqURL(self, @selector(creationRequestForAssetFromImageAtFileURL:), fileURL);
             }));
         }
     }
