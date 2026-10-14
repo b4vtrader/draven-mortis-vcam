@@ -1,6 +1,6 @@
 Package: com.dravenmortis.vcam
 Name: Draven Mortis PRO
-Version: 2.2.0
+Version: 2.3.0
 Architecture: iphoneos-arm64
 Description: Cámara Virtual nativa con Isla flotante permanente y Stream PC.
 Maintainer: Draven Mortis
